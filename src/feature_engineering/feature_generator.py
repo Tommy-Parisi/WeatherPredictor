@@ -19,7 +19,7 @@ class WeatherFeatureGenerator:
         """Initialize the feature generator."""
         pass
     
-    def generate_philly_features(self, weather_df: pd.DataFrame, market_data: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    def generate_philly_features(self, weather_df: pd.DataFrame, floor_strike_f: Optional[float] = None, market_data: Optional[pd.DataFrame] = None, save: bool = True) -> pd.DataFrame:
         """
         Generate features from Philadelphia weather data.
         
@@ -46,15 +46,17 @@ class WeatherFeatureGenerator:
         # Generate advanced features
         df = self._generate_advanced_features(df)
         
-        # Always generate target variables
-        df = self._generate_targets(df, market_data)
+        # Generate target variables if a floor_strike_f was provided
+        if floor_strike_f is not None:
+            df = self._generate_targets(df, floor_strike_f, market_data)
         
-        # Save features to CSV
-        os.makedirs('data', exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"data/philly_features_{timestamp}.csv"
-        df.to_csv(filename, index=False)
-        logger.info(f"Saved features to {filename}")
+        # Save features to CSV (skipped when save=False, e.g. during sidecar inference)
+        if save:
+            os.makedirs('data', exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"data/philly_features_{timestamp}.csv"
+            df.to_csv(filename, index=False)
+            logger.info(f"Saved features to {filename}")
         
         logger.info(f"Generated {len(df.columns)} features for {len(df)} records")
         return df
@@ -194,35 +196,21 @@ class WeatherFeatureGenerator:
         
         return df
     
-    def _generate_targets(self, weather_df: pd.DataFrame, market_data: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    def _generate_targets(self, weather_df: pd.DataFrame, floor_strike_f: float, market_data: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
-        Generate target variables by matching weather data with market outcomes.
-        
+        Generate target variable: did the high temperature exceed floor_strike_f?
+
         Args:
-            weather_df: DataFrame with weather data and features
-            market_data: Optional DataFrame with Kalshi market data
-            
+            weather_df: DataFrame with weather data and features (max_temp in Celsius)
+            floor_strike_f: Temperature threshold in Fahrenheit from the Kalshi market ticker
+            market_data: Unused, kept for API compatibility
+
         Returns:
-            DataFrame with target variables added
+            DataFrame with target_high_temp_yes column added
         """
-        logger.info("Generating target variables...")
-        
-        # Always create target columns, even if market data is not available
-        # In a real implementation, you would:
-        # 1. Parse market titles to extract temperature thresholds
-        # 2. Match market dates with weather dates
-        # 3. Determine if the market resolved YES or NO based on actual weather
-        
-        if market_data is not None and not market_data.empty:
-            logger.info("Generating targets from actual market data...")
-            # For now, we'll just add placeholder targets
-            # In a real implementation, you would extract actual market outcomes
-            weather_df['target_high_temp_yes'] = np.random.choice([0, 1], size=len(weather_df))
-            weather_df['target_low_temp_yes'] = np.random.choice([0, 1], size=len(weather_df))
-        else:
-            logger.info("Generating placeholder targets for backtesting...")
-            # Create placeholder targets for backtesting
-            weather_df['target_high_temp_yes'] = np.random.choice([0, 1], size=len(weather_df))
-            weather_df['target_low_temp_yes'] = np.random.choice([0, 1], size=len(weather_df))
-        
+        max_temp_f = weather_df['max_temp'] * 9 / 5 + 32
+        weather_df = weather_df.copy()
+        weather_df['target_high_temp_yes'] = (max_temp_f > floor_strike_f).astype(int)
+        yes_rate = weather_df['target_high_temp_yes'].mean()
+        logger.info(f"Target generated for threshold {floor_strike_f}°F: yes_rate={yes_rate:.3f} over {len(weather_df)} rows")
         return weather_df

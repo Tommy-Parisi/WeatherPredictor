@@ -165,15 +165,8 @@ class NOAADownloader:
             # Convert date column to datetime
             df_pivot['date'] = pd.to_datetime(df_pivot['date'])
             
-            # Convert temperature from tenths of degrees Celsius to degrees Celsius
-            if 'max_temp' in df_pivot.columns:
-                df_pivot['max_temp'] = df_pivot['max_temp'] / 10.0
-            if 'min_temp' in df_pivot.columns:
-                df_pivot['min_temp'] = df_pivot['min_temp'] / 10.0
-            
-            # Convert precipitation from tenths of mm to mm
-            if 'precipitation' in df_pivot.columns:
-                df_pivot['precipitation'] = df_pivot['precipitation'] / 10.0
+            # NOAA CDO API with units=metric returns temperatures in Celsius
+            # and precipitation in mm — no unit conversion needed here.
             
             # Add additional derived features
             if 'max_temp' in df_pivot.columns:
