@@ -1,245 +1,275 @@
 """
 WeatherPredictor sidecar — HTTP service for the Kalshi trading bot.
 
-Loads the Philadelphia high-temp XGBoost model at startup, caches recent NOAA
-data (TTL configurable), and serves calibrated P(high_temp > floor_strike_f)
-for Kalshi weather market tickers.
+Prediction path (new)
+---------------------
+Uses GEFS 31-member ensemble forecasts from NOMADS. A background thread fetches
+and caches ensemble data for today and tomorrow, refreshing every GEFS_REFRESH_SECS.
+The /predict endpoint reads from that cache and returns in well under the Rust
+bot's 3-second timeout.
 
-Endpoints:
-    GET /health              → {"status": "ok", "model_loaded": true}
-    GET /predict?ticker=...  → {"prob": 0.73, "floor_strike_f": 85.0, "city": "PHI"}
+Response contract (motorcade standard)
+---------------------------------------
+    {
+        "probability":    0.62,       # P(daily_high > floor_strike_f)
+        "data_age_secs":  1800,       # seconds since GEFS data was fetched
+        "data_source_ok": true,       # false → Rust bot falls back to bucket model
+        "model_version":  "gefs_v1"
+    }
+
+data_source_ok is false when:
+  - GEFS cache is empty (startup warmup not complete)
+  - Cached data is older than MAX_DATA_AGE_SECS (default 2 h)
+  - Fewer than MIN_MEMBERS_REQUIRED ensemble members succeeded
+
+Endpoints
+---------
+    GET /health              → {"status": "ok", "cache_dates": [...], "model_version": "gefs_v1"}
+    GET /predict?ticker=...  → motorcade response contract above
 
 Supported tickers: KXHIGH{PHI,PHIL,PHILLY,PHL}*  (Philadelphia high-temp only).
 
-Environment variables:
-    NOAA_API_TOKEN          Required. NOAA CDO API token.
-    NOAA_STATION_ID         Optional. Default: GHCND:USW00013739 (PHL Airport).
-    WEATHER_MODEL_PATH      Optional. Explicit model path; auto-selects newest if unset.
-    WEATHER_SIDECAR_HOST    Optional. Default: 127.0.0.1
-    WEATHER_SIDECAR_PORT    Optional. Default: 8765
-    WEATHER_NOAA_CACHE_TTL_SECS  Optional. Default: 3600 (1 hour).
+Environment variables
+---------------------
+    WEATHER_SIDECAR_HOST         Optional. Default: 127.0.0.1
+    WEATHER_SIDECAR_PORT         Optional. Default: 8765
+    GEFS_REFRESH_SECS            Optional. Default: 7200 (2 hours)
+    GEFS_MAX_DATA_AGE_SECS       Optional. Default: 7200 (2 hours)
 """
 
-import glob
 import json
 import logging
 import os
 import re
+import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
-import joblib
-import pandas as pd
-import requests
 from fastapi import FastAPI, HTTPException
+
+from src.data_collection.gefs_fetcher import GEFSResult, fetch_ensemble_daily_highs, MEMBERS
+from src.modeling.ensemble_predictor import predict as ensemble_predict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="WeatherPredictor Sidecar", version="1.0")
+app = FastAPI(title="WeatherPredictor Sidecar", version="2.0")
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 
-NOAA_API_TOKEN       = os.getenv("NOAA_API_TOKEN", "")
-NOAA_STATION_ID      = os.getenv("NOAA_STATION_ID", "GHCND:USW00013739")
-MODEL_PATH           = os.getenv("WEATHER_MODEL_PATH", "")
-NOAA_CACHE_TTL_SECS  = int(os.getenv("WEATHER_NOAA_CACHE_TTL_SECS", "3600"))
+GEFS_REFRESH_SECS    = int(os.getenv("GEFS_REFRESH_SECS",      "7200"))
+MAX_DATA_AGE_SECS    = int(os.getenv("GEFS_MAX_DATA_AGE_SECS", "7200"))
+PREDICTION_LOG_DIR   = Path(os.getenv("GEFS_PREDICTION_LOG_DIR", "var/logs/gefs_predictions"))
 
-# All city codes that map to Philadelphia in Kalshi tickers
+MODEL_VERSION = "gefs_v1"
+
+# Philadelphia city codes accepted in tickers
 PHILADELPHIA_CODES = {"PHI", "PHIL", "PHILLY", "PHL"}
 
-# ── Runtime state ─────────────────────────────────────────────────────────────
+# ── Prediction log ────────────────────────────────────────────────────────────
+#
+# One JSONL file per day under PREDICTION_LOG_DIR.
+# Each line is a complete prediction record including all member highs so we
+# can later join against NOAA actuals to build the bias correction table.
+#
+# Schema (all fields always present):
+#   ts              ISO-8601 UTC timestamp of this prediction
+#   ticker          Kalshi ticker
+#   target_date     YYYY-MM-DD date the market resolves
+#   threshold_f     floor strike in °F from the ticker
+#   probability     P(high > threshold_f) returned to the bot
+#   n_members       number of ensemble members that succeeded
+#   member_highs_f  list of per-member predicted daily highs (°F)
+#   run_time        ISO-8601 UTC of the GEFS model run used
+#   data_age_secs   age of GEFS data at prediction time
+#   model_version   e.g. "gefs_v1"
 
-_model        = None
-_feature_cols = None
-_noaa_cache: dict = {"df": None, "fetched_at": 0.0}
-
-# ── Model loading ─────────────────────────────────────────────────────────────
-
-def _find_latest_model() -> str:
-    candidates = sorted(glob.glob("models/philly_weather_xgb_target_high_temp_yes_*.joblib"))
-    if not candidates:
-        raise FileNotFoundError(
-            "No model files found in models/. Run train_weather_model.py first."
-        )
-    return candidates[-1]
+_log_lock = threading.Lock()
 
 
-def _load_model():
-    global _model, _feature_cols
-    path = MODEL_PATH or _find_latest_model()
-    logger.info(f"Loading model from {path}")
-    _model = joblib.load(path)
+def _write_prediction_log(record: dict) -> None:
+    """Append one prediction record to today's JSONL log. Silently swallows errors."""
+    try:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = PREDICTION_LOG_DIR / f"predictions_{day}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, default=str) + "\n"
+        with _log_lock:
+            with open(path, "a") as f:
+                f.write(line)
+    except Exception as exc:
+        logger.warning(f"prediction log write failed: {exc}")
 
-    # Load the feature column list saved alongside the model during training
-    meta_path = re.sub(
-        r"philly_weather_xgb_target_high_temp_yes_",
-        "philly_weather_metrics_target_high_temp_yes_",
-        path,
-    ).replace(".joblib", ".json")
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-        _feature_cols = meta.get("feature_columns")
-        logger.info(f"Feature list loaded ({len(_feature_cols)} cols) from {meta_path}")
+
+# ── Cache ──────────────────────────────────────────────────────────────────────
+#
+# Keyed by target date. Each value is a GEFSResult (which carries its own
+# fetch_time). A single lock guards all reads and writes.
+
+_cache: dict[date, GEFSResult] = {}
+_cache_lock = threading.Lock()
+
+
+def _refresh_date(target_date: date) -> None:
+    """Fetch GEFS data for one target date and store in cache."""
+    logger.info(f"GEFS refresh: fetching {target_date}")
+    result = fetch_ensemble_daily_highs(target_date)
+    if result is not None:
+        with _cache_lock:
+            _cache[target_date] = result
+        logger.info(f"GEFS cache updated: {target_date}  members={result.n_members}")
     else:
-        _feature_cols = None
-        logger.warning(f"No metrics JSON at {meta_path}; relying on model.feature_names_in_")
-    logger.info("Model ready.")
+        logger.warning(f"GEFS refresh failed for {target_date}")
 
 
-# ── NOAA data ─────────────────────────────────────────────────────────────────
-
-def _fetch_noaa_df() -> pd.DataFrame:
-    """Fetch ~35 days of NOAA CDO data for Philadelphia in memory (no local CSV write)."""
-    if not NOAA_API_TOKEN:
-        raise RuntimeError("NOAA_API_TOKEN is not set")
-
-    end_date   = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=35)
-
-    resp = requests.get(
-        "https://www.ncei.noaa.gov/cdo-web/api/v2/data",
-        headers={"token": NOAA_API_TOKEN},
-        params={
-            "datasetid":      "GHCND",
-            "stationid":      NOAA_STATION_ID,
-            "startdate":      str(start_date),
-            "enddate":        str(end_date),
-            "datatypeid":     "TMAX,TMIN,PRCP",
-            "limit":          1000,
-            "units":          "metric",
-            "includemetadata": "false",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
-    if not results:
-        raise RuntimeError("NOAA returned no results for the requested date range")
-
-    df = pd.DataFrame(results)
-    pivot = (
-        df.pivot_table(index="date", columns="datatype", values="value", aggfunc="first")
-        .reset_index()
-        .rename(columns={"TMAX": "max_temp", "TMIN": "min_temp", "PRCP": "precipitation"})
-    )
-    pivot["date"] = pd.to_datetime(pivot["date"])
-    pivot = pivot.sort_values("date").reset_index(drop=True)
-
-    # CDO metric API already returns °C and mm — no unit conversion needed
-    logger.info(
-        f"NOAA: {len(pivot)} rows  "
-        f"{pivot['date'].min().date()} – {pivot['date'].max().date()}  "
-        f"max_temp {pivot['max_temp'].min():.1f}–{pivot['max_temp'].max():.1f}°C"
-    )
-    return pivot
+def _background_refresh() -> None:
+    """Background thread: refresh today + tomorrow every GEFS_REFRESH_SECS.
+    Sleeps first so startup warmup and first background fetch don't overlap."""
+    time.sleep(GEFS_REFRESH_SECS)
+    while True:
+        today = datetime.now(timezone.utc).date()
+        for target_date in [today, today + timedelta(days=1)]:
+            try:
+                _refresh_date(target_date)
+            except Exception as exc:
+                logger.error(f"GEFS refresh error for {target_date}: {exc}", exc_info=True)
+        time.sleep(GEFS_REFRESH_SECS)
 
 
-def _get_noaa_df() -> pd.DataFrame:
-    """Return cached NOAA data, refreshing if the cache is stale."""
-    now = time.monotonic()
-    if (
-        _noaa_cache["df"] is not None
-        and (now - _noaa_cache["fetched_at"]) < NOAA_CACHE_TTL_SECS
-    ):
-        return _noaa_cache["df"]
-    logger.info("NOAA cache miss — fetching fresh data")
-    df = _fetch_noaa_df()
-    _noaa_cache["df"]         = df
-    _noaa_cache["fetched_at"] = now
-    return df
+# ── Ticker parsing ─────────────────────────────────────────────────────────────
 
-
-# ── Inference ─────────────────────────────────────────────────────────────────
-
-def _build_features(noaa_df: pd.DataFrame, floor_strike_f: float) -> pd.DataFrame:
-    from src.feature_engineering.feature_generator import WeatherFeatureGenerator
-    gen    = WeatherFeatureGenerator()
-    feat   = gen.generate_philly_features(noaa_df.copy(), floor_strike_f=None, save=False)
-    feat["floor_strike_f"] = floor_strike_f
-    return feat
-
-
-def _run_inference(feat_df: pd.DataFrame) -> float:
-    row = feat_df.tail(1).copy()
-
-    if _feature_cols:
-        for c in _feature_cols:
-            if c not in row.columns:
-                row[c] = 0.0
-        row = row[_feature_cols]
-
-    row = row.fillna(0).apply(pd.to_numeric, errors="coerce").fillna(0)
-    return float(_model.predict_proba(row)[0, 1])
-
-
-# ── Ticker parsing ────────────────────────────────────────────────────────────
-
-def _parse_ticker(ticker: str) -> tuple[Optional[str], Optional[float]]:
+def _parse_ticker(ticker: str) -> tuple[Optional[str], Optional[date], Optional[float]]:
     """
-    Extract (city_code, floor_strike_f) from a Kalshi weather ticker.
+    Parse a Kalshi weather ticker into (city_code, target_date, floor_strike_f).
 
     Examples:
-        KXHIGHPHI-26APR15-T55   → ("PHI",  55.0)
-        KXHIGHPHIL-25JUL31-T92  → ("PHIL", 92.0)
+        KXHIGHPHI-26APR15-T55   → ("PHI",  date(2026, 4, 15),  55.0)
+        KXHIGHPHIL-25JUL31-T92  → ("PHIL", date(2025, 7, 31),  92.0)
     """
     upper = ticker.upper()
     if not upper.startswith("KXHIGH"):
-        return None, None
+        return None, None, None
 
     rest     = upper[len("KXHIGH"):]
     city_end = next((i for i, c in enumerate(rest) if not c.isalpha()), len(rest))
     city     = rest[:city_end]
 
-    m = re.search(r"-T(\d+)$", upper)
-    return city, float(m.group(1)) if m else None
+    date_match = re.search(r"-(\d{2}[A-Z]{3}\d{2})-", upper)
+    target_date = None
+    if date_match:
+        try:
+            target_date = datetime.strptime(date_match.group(1), "%y%b%d").date()
+        except ValueError:
+            pass
+
+    thresh_match = re.search(r"-T(\d+)$", upper)
+    floor_strike_f = float(thresh_match.group(1)) if thresh_match else None
+
+    return city, target_date, floor_strike_f
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 def on_startup():
-    _load_model()
+    # Pre-warm the cache before serving traffic, then keep it fresh in background.
+    today = datetime.now(timezone.utc).date()
+    for target_date in [today, today + timedelta(days=1)]:
+        try:
+            _refresh_date(target_date)
+        except Exception as exc:
+            logger.error(f"Startup GEFS fetch failed for {target_date}: {exc}")
+
+    t = threading.Thread(target=_background_refresh, daemon=True)
+    t.start()
+    logger.info("Background GEFS refresh thread started")
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": _model is not None}
+    with _cache_lock:
+        cache_dates = sorted(str(d) for d in _cache.keys())
+    return {
+        "status":        "ok",
+        "cache_dates":   cache_dates,
+        "model_version": MODEL_VERSION,
+    }
 
 
 @app.get("/predict")
 def predict(ticker: str):
-    if _model is None:
-        raise HTTPException(503, "Model not loaded")
-
-    city, floor_strike_f = _parse_ticker(ticker)
+    city, target_date, floor_strike_f = _parse_ticker(ticker)
 
     if city is None or city not in PHILADELPHIA_CODES:
-        raise HTTPException(404, f"Unsupported city '{city}' — only Philadelphia (PHI/PHIL) supported")
-
+        raise HTTPException(404, f"Unsupported city '{city}' — only Philadelphia supported")
+    if target_date is None:
+        raise HTTPException(400, f"Cannot parse target date from ticker '{ticker}'")
     if floor_strike_f is None:
         raise HTTPException(400, f"Cannot parse floor_strike_f from ticker '{ticker}'")
 
-    try:
-        noaa_df = _get_noaa_df()
-    except Exception as exc:
-        logger.error(f"NOAA fetch failed: {exc}")
-        raise HTTPException(502, f"NOAA data unavailable: {exc}")
+    with _cache_lock:
+        result = _cache.get(target_date)
 
-    try:
-        feat_df = _build_features(noaa_df, floor_strike_f)
-        prob    = _run_inference(feat_df)
-    except Exception as exc:
-        logger.error(f"Inference error for {ticker}: {exc}", exc_info=True)
-        raise HTTPException(500, f"Inference error: {exc}")
+    # No data yet (startup warmup still running or date not cached)
+    if result is None:
+        logger.warning(f"predict: cache miss for {target_date} ({ticker})")
+        return {
+            "probability":    0.5,
+            "data_age_secs":  -1,
+            "data_source_ok": False,
+            "model_version":  MODEL_VERSION,
+        }
 
-    logger.info(f"predict  ticker={ticker}  city={city}  threshold={floor_strike_f}°F  prob={prob:.4f}")
-    return {"prob": prob, "floor_strike_f": floor_strike_f, "city": city, "ticker": ticker}
+    data_age_secs = int((datetime.now(timezone.utc) - result.fetch_time).total_seconds())
+
+    if data_age_secs > MAX_DATA_AGE_SECS:
+        logger.warning(
+            f"predict: stale cache for {target_date} "
+            f"(age={data_age_secs}s > max={MAX_DATA_AGE_SECS}s)"
+        )
+        return {
+            "probability":    0.5,
+            "data_age_secs":  data_age_secs,
+            "data_source_ok": False,
+            "model_version":  MODEL_VERSION,
+        }
+
+    prob = ensemble_predict(
+        member_highs_f=result.member_highs_f,
+        floor_strike_f=floor_strike_f,
+        target_date=target_date,
+        members=MEMBERS[:result.n_members],
+    )
+
+    logger.info(
+        f"predict  ticker={ticker}  threshold={floor_strike_f}°F  "
+        f"prob={prob:.4f}  members={result.n_members}  age={data_age_secs}s"
+    )
+
+    _write_prediction_log({
+        "ts":             datetime.now(timezone.utc).isoformat(),
+        "ticker":         ticker,
+        "target_date":    str(target_date),
+        "threshold_f":    floor_strike_f,
+        "probability":    prob,
+        "n_members":      result.n_members,
+        "member_highs_f": result.member_highs_f,
+        "run_time":       result.run_time.isoformat(),
+        "data_age_secs":  data_age_secs,
+        "model_version":  MODEL_VERSION,
+    })
+
+    return {
+        "probability":    prob,
+        "data_age_secs":  data_age_secs,
+        "data_source_ok": True,
+        "model_version":  MODEL_VERSION,
+    }
 
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
+# ── Entrypoint ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,1 +1,1 @@
-from .train_weather_model import train_weather_model
+# Training utilities are imported explicitly where needed, not at package load time.
